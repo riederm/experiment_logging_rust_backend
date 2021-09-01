@@ -21,14 +21,20 @@ async fn main() -> std::io::Result<()> {
 struct ListQuery {
     n : Option<usize>,
     severity : Option<String>,
+    last_secs : Option<usize>,
+    cursor : Option<String>,
 }
 
 #[get("/logs")]
 async fn list(query: web::Query<ListQuery>) -> impl Responder {
-    let logs = query_journal(&query.n, &query.severity);
-    if let Ok(entry) = logs {
-        HttpResponse::Ok().json(entry)
-    } else {
-        HttpResponse::Ok().body("no entry :-(")
+    let logs = query_journal(&query.n, &query.severity, &query.last_secs, &query.cursor);
+
+    match logs {
+        Ok(entries) => {
+            HttpResponse::Ok().json(entries)
+        },
+        Err(err) => {
+            HttpResponse::BadRequest().body(err)
+        },
     }
 }

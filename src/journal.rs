@@ -1,5 +1,7 @@
 use std::{
+    ops::Sub,
     str::FromStr,
+    time::{Duration, SystemTime},
 };
 
 use journald::{
@@ -10,9 +12,9 @@ use serde::Serialize;
 
 #[derive(Debug, Serialize)]
 pub enum Severity {
-    Error = 0,
-    Warning = 5,
-    Info = 99,
+    Error,
+    Warning,
+    Info,
 }
 
 impl FromStr for Severity {
@@ -59,6 +61,8 @@ pub struct LogEntry {
     severity: Severity,
     origin: String,
     date: i64,
+    #[serde(skip)]
+    cursor: String,
 }
 
 fn create_journal() -> Result<JournalReader, String> {
@@ -70,35 +74,74 @@ fn create_journal() -> Result<JournalReader, String> {
     Ok(journal)
 }
 
+fn create_journal_at(cursor: &str) -> Result<JournalReader, String> {
+    let mut journal =
+        JournalReader::open(&JournalReaderConfig::default()).expect("journal open failed");
+    journal
+        .seek(JournalSeek::Cursor(cursor.into()))
+        .map_err(|_| "Cannot initialize journald")?;
+    Ok(journal)
+}
+
+#[derive(Serialize)]
+pub struct QueryResult {
+    entries: Vec<LogEntry>,
+    last_cursor: String,
+}
+
 pub fn query_journal(
     n: &Option<usize>,
     severity: &Option<String>,
-) -> Result<Vec<LogEntry>, String> {
+    last_secs: &Option<usize>,
+    cursor: &Option<String>,
+) -> Result<QueryResult, String> {
     let prio = severity
         .as_ref()
         .and_then(|it| Severity::from_str(it.as_str()).ok())
         .map(|it| it.cardinality())
         .unwrap_or(usize::MAX);
 
-    let entries = JournalReaderIterator::of(create_journal()?)
+    let smallest_ts = last_secs
+        .and_then(|last_secs| {
+            SystemTime::now()
+                .sub(Duration::from_secs(last_secs as u64))
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|it| it.as_micros())
+                .ok()
+        })
+        .unwrap_or(0u128);
+
+    let mut journal = cursor
+        .as_ref()
+        .map(|c| create_journal_at(c.as_str()))
+        .unwrap_or_else(|| create_journal())?;
+
+    let entries: Vec<LogEntry> = JournalReaderIterator::of(&mut journal)
         .filter(|it| it.severity.cardinality() <= prio)
+        .take_while(|it| it.date as u128 >= smallest_ts)
         .take(n.unwrap_or(100))
         .collect();
 
-    Ok(entries)
+    let last_cursor = entries.last().map(|e| e.cursor.clone()).unwrap_or_default();
+
+    Ok(QueryResult {
+        last_cursor,
+        entries,
+    })
+    //Ok(entries)
 }
 
-pub struct JournalReaderIterator {
-    reader: JournalReader,
+pub struct JournalReaderIterator<'a> {
+    reader: &'a mut JournalReader,
 }
 
-impl JournalReaderIterator {
-    pub fn of(j: JournalReader) -> JournalReaderIterator {
+impl<'a> JournalReaderIterator<'a> {
+    pub fn of(j: &'a mut JournalReader) -> JournalReaderIterator<'a> {
         JournalReaderIterator { reader: j }
     }
 }
 
-impl Iterator for JournalReaderIterator {
+impl<'a> Iterator for JournalReaderIterator<'a> {
     type Item = LogEntry;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -127,6 +170,7 @@ impl LogEntry {
             severity,
             date,
             origin: je.get_field("_SYSTEMD_UNIT").unwrap_or_default().into(),
+            cursor: je.get_field("__CURSOR").unwrap_or_default().into(),
         }
     }
 }
