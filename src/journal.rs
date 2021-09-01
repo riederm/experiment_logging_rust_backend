@@ -1,14 +1,56 @@
+use std::{
+    str::FromStr,
+};
+
 use journald::{
     reader::{JournalReader, JournalReaderConfig, JournalSeek},
     JournalEntry,
 };
-use serde::{Serialize};
+use serde::Serialize;
 
 #[derive(Debug, Serialize)]
 pub enum Severity {
-    Error,
-    Warning,
-    Info,
+    Error = 0,
+    Warning = 5,
+    Info = 99,
+}
+
+impl FromStr for Severity {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.to_lowercase().as_str() {
+            "error" => Ok(Severity::Error),
+            "warning" => Ok(Severity::Warning),
+            "info" => Ok(Severity::Info),
+            _ => Err(format!("Unknown severity: {}", s)),
+        }
+    }
+}
+
+impl Severity {
+    pub fn cardinality(&self) -> usize {
+        match self {
+            Severity::Error => 0,
+            Severity::Warning => 1,
+            Severity::Info => 2,
+        }
+    }
+
+    fn from_priority(it: &str) -> Severity {
+        let it = it.parse::<usize>();
+
+        it.map(|it| {
+            if it <= 3 {
+                Severity::Error
+            } else if it <= 5 {
+                Severity::Warning
+            } else {
+                Severity::Info
+            }
+        })
+        .unwrap_or(Severity::Info)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -19,53 +61,71 @@ pub struct LogEntry {
     date: i64,
 }
 
-
-
-pub fn read_last_n_entries(n: usize) -> Result<Vec<LogEntry>, String> {
+fn create_journal() -> Result<JournalReader, String> {
     let mut journal =
         JournalReader::open(&JournalReaderConfig::default()).expect("journal open failed");
-    journal.seek(JournalSeek::Tail).unwrap();
+    journal
+        .seek(JournalSeek::Tail)
+        .map_err(|_| "Cannot initialize journald")?;
+    Ok(journal)
+}
 
-    let mut current_entry = journal
-        .previous_entry()
-        .map_err(|_| "cannot retrieve journal entry".to_string())?;
-    let mut entries = Vec::new();
-    while let Some(ce) = current_entry {
-        let e = LogEntry::from_journal_entry(&ce);
-        entries.push(e);
+pub fn query_journal(
+    n: &Option<usize>,
+    severity: &Option<String>,
+) -> Result<Vec<LogEntry>, String> {
+    let prio = severity
+        .as_ref()
+        .and_then(|it| Severity::from_str(it.as_str()).ok())
+        .map(|it| it.cardinality())
+        .unwrap_or(usize::MAX);
 
-        current_entry = if entries.len() >= n {
-            None
-        } else {
-            journal
-                .previous_entry()
-                .map_err(|_| "cannot retrieve journal entry".to_string())?
-        }
-    }
+    let entries = JournalReaderIterator::of(create_journal()?)
+        .filter(|it| it.severity.cardinality() <= prio)
+        .take(n.unwrap_or(100))
+        .collect();
 
     Ok(entries)
+}
+
+pub struct JournalReaderIterator {
+    reader: JournalReader,
+}
+
+impl JournalReaderIterator {
+    pub fn of(j: JournalReader) -> JournalReaderIterator {
+        JournalReaderIterator { reader: j }
+    }
+}
+
+impl Iterator for JournalReaderIterator {
+    type Item = LogEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.reader.previous_entry() {
+            Ok(Some(it)) => Some(LogEntry::from_journal_entry(&it)),
+            Ok(None) => None,
+            Err(err) => {
+                println!("Error: {:}", err);
+                None
+            }
+        }
+    }
 }
 
 impl LogEntry {
     pub fn from_journal_entry(je: &JournalEntry) -> LogEntry {
         let severity = je
             .get_field("PRIORITY")
-            .and_then(|it| it.parse::<i32>().ok())
-            .map(|it| {
-                if it <= 3 {
-                    Severity::Error
-                } else if it <= 5 {
-                    Severity::Warning
-                } else {
-                    Severity::Info
-                }
-            })
+            .map(|it| Severity::from_priority(it))
             .unwrap_or(Severity::Info);
+
+        let date = je.get_wallclock_time().map_or(0, |it| it.timestamp_us);
 
         LogEntry {
             message: je.get_message().unwrap_or_default().into(),
             severity,
-            date: je.get_wallclock_time().map_or(0, |it| it.timestamp_us),
+            date,
             origin: je.get_field("_SYSTEMD_UNIT").unwrap_or_default().into(),
         }
     }
